@@ -6,6 +6,12 @@ module Stache
     # In Rails 3.1+, template handlers don't inherit from anything. In <= 3.0, they do.
     # To avoid messy logic figuring this out, we just inherit from whatever the ERB handler does.
     class Handler < Stache::Util.av_template_class(:Handlers)::ERB.superclass
+      class << self
+        def cached_contexts
+          @cached_contexts ||= {}
+        end
+      end
+
       if Stache::Util.needs_compilable?
         include Stache::Util.av_template_class(:Handlers)::Compilable
       end
@@ -13,26 +19,35 @@ module Stache
       def compile(template)
         handlebars_class = handlebars_class_from_template(template)
         <<-RUBY_CODE
-          handlebars = ::#{handlebars_class}.new
-          handlebars.view = self
+          handlebars =
+            Stache::Handlebars::Handler.cached_contexts['::#{handlebars_class}']
 
-          handlebars.register_helper('helperMissing') do |name, *args|
-            meth, *params, options = args
+          if handlebars.nil?
+            handlebars = ::#{handlebars_class}.new
 
-            if handlebars.respond_to?(meth)
-              handlebars.send(meth, *params)
-            elsif self.respond_to?(meth)
-              self.send(meth, *params)
-            elsif params.size == 0
-              ""
-            else
-              raise "Could not find property '\#\{meth\}'"
+            handlebars.register_helper('helperMissing') do |name, *args|
+              meth, *params, options = args
+
+              if handlebars.respond_to?(meth)
+                handlebars.send(meth, *params)
+              elsif self.respond_to?(meth)
+                self.send(meth, *params)
+              elsif params.size == 0
+                ""
+              else
+                raise "Could not find property '\#\{meth\}'"
+              end
+            end
+
+            handlebars.register_helper('yield') do |name, *args|
+              content_for(:layout)
             end
           end
 
-          handlebars.register_helper('yield') do |name, *args|
-            content_for(:layout)
-          end
+          handlebars.view = self
+
+          Stache::Handlebars::Handler.cached_contexts['::#{handlebars_class}'] =
+            handlebars
 
           template = handlebars.compile('#{template.source.gsub(/'/, "\\\\'")}')
           vars = {}
@@ -43,18 +58,20 @@ module Stache
           vars.merge!(options[:context] || {}) if options
 
           handlebars.partial_missing do |name|
-            search_path = '#{template.virtual_path}'.split("/")[0..-2]
-            file = (search_path + [name]).join("/")
-            finder = lambda do |partial|
-              self.lookup_context.find(file, [], partial, [], {formats: [:html]})
-            end
-            template = finder.call(false) rescue finder.call(true)
+            lambda do |this, context, options|
+              search_path = '#{template.virtual_path}'.split("/")[0..-2]
+              file = (search_path + [name]).join("/")
+              finder = lambda do |partial|
+                self.lookup_context.find(file, [], partial, [], {formats: [:html]})
+              end
+              template = finder.call(false) rescue finder.call(true)
 
-            if template
-              t = handlebars.compile(template.source)
-              t.call(vars).html_safe
-            else
-              raise "Could not find template '\#\{file\}'"
+              if template
+                t = handlebars.compile(template.source)
+                t.call(vars).html_safe
+              else
+                raise "Could not find template '\#\{file\}'"
+              end
             end
           end
 
